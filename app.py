@@ -20,6 +20,7 @@ for _k in ("SPENDING_BACKEND", "ANTHROPIC_API_KEY", "SPENDING_MODEL",
 if not os.environ.get("SPENDING_BACKEND") and os.environ.get("ANTHROPIC_API_KEY"):
     os.environ["SPENDING_BACKEND"] = "api"
 
+import altair as alt  # noqa: E402
 import pandas as pd  # noqa: E402
 
 import db  # noqa: E402
@@ -97,6 +98,45 @@ elif not pdf_parser.cli_logged_in():
     else:
         st.caption("Could not find the Claude Code binary. Set CLAUDE_BIN to its path.")
 
+# Fetch all data once, then build a shared filtered view used by the table + dashboard.
+all_rows = db.fetch_transactions()
+df_all = pd.DataFrame(all_rows)
+if not df_all.empty:
+    df_all["amount"] = pd.to_numeric(df_all["amount"], errors="coerce").fillna(0)
+    df_all["month"] = df_all["date"].astype(str).str.slice(0, 7)
+
+
+def _build_filters(df):
+    """Sidebar filters shared by Transactions + Dashboard. Returns the filtered df."""
+    if df.empty:
+        return df
+    st.sidebar.header("Filters")
+    people = sorted(x for x in df["person"].dropna().unique() if x != "")
+    cats = sorted(x for x in df["category"].dropna().unique() if x != "")
+    months = sorted(x for x in df["month"].dropna().unique() if x != "")
+    cards = sorted(x for x in df["card"].dropna().unique() if x != "")
+
+    sel_people = st.sidebar.multiselect("Person", people, default=people)
+    sel_cats = st.sidebar.multiselect("Category", cats, default=cats)
+    sel_months = st.sidebar.multiselect("Month", months, default=months)
+    sel_cards = st.sidebar.multiselect("Card", cards, default=cards)
+    search = st.sidebar.text_input("Search merchant")
+    if st.sidebar.button("Reset filters"):
+        st.rerun()
+
+    out = df[
+        df["person"].isin(sel_people)
+        & df["category"].isin(sel_cats)
+        & df["month"].isin(sel_months)
+        & df["card"].isin(sel_cards)
+    ]
+    if search:
+        out = out[out["merchant"].str.contains(search, case=False, na=False)]
+    return out
+
+
+fdf = _build_filters(df_all)
+
 tab_upload, tab_txns, tab_dash, tab_people = st.tabs(
     ["Upload", "Transactions", "Dashboard", "People"]
 )
@@ -104,12 +144,16 @@ tab_upload, tab_txns, tab_dash, tab_people = st.tabs(
 # ---------------------------------------------------------------- Upload
 with tab_upload:
     st.subheader("Upload statement PDFs")
+    if st.session_state.pop("upload_done", None):
+        for msg in st.session_state.pop("upload_msgs", []):
+            st.success(msg)
     files = st.file_uploader(
         "Drop one or more credit-card statement PDFs",
         type="pdf",
         accept_multiple_files=True,
     )
     if files and st.button("Parse & record", type="primary"):
+        msgs = []
         for f in files:
             with st.spinner(f"Reading {f.name} with Claude..."):
                 try:
@@ -120,22 +164,30 @@ with tab_upload:
                 for t in txns:
                     t["person"] = db.resolve_person(t.get("cardholder", ""))
                 added, skipped = db.insert_transactions(txns, f.name)
-            st.success(
+            msgs.append(
                 f"{f.name}: {added} added, {skipped} duplicates skipped "
                 f"({len(txns)} found)."
             )
+        st.session_state["upload_msgs"] = msgs
+        st.session_state["upload_done"] = True
+        st.rerun()
 
 # ---------------------------------------------------------------- Transactions
 with tab_txns:
     st.subheader("Transactions")
-    rows = db.fetch_transactions()
-    if not rows:
+    if df_all.empty:
         st.info("No transactions yet. Upload a statement to get started.")
+    elif fdf.empty:
+        st.warning("No transactions match the current filters.")
     else:
-        df = pd.DataFrame(rows)
-        people = sorted({r["person"] for r in rows} | {"Unknown"})
+        st.caption(
+            f"Showing {len(fdf)} of {len(df_all)} transactions · "
+            f"filtered total ${fdf['amount'].sum():,.2f}"
+        )
+        people = sorted(set(df_all["person"].dropna()) | {"Unknown"})
         edited = st.data_editor(
-            df[["id", "date", "merchant", "amount", "category", "person", "cardholder", "card"]],
+            fdf[["id", "date", "merchant", "amount", "category", "person",
+                 "cardholder", "card"]],
             column_config={
                 "id": None,
                 "cardholder": st.column_config.TextColumn("Cardholder", disabled=True),
@@ -150,51 +202,100 @@ with tab_txns:
             use_container_width=True,
             key="txn_editor",
         )
-        if st.button("Save edits"):
-            orig = {r["id"]: r for r in rows}
+        if st.button("Save edits", type="primary"):
+            orig = {r["id"]: r for r in all_rows}
+            n = 0
             for _, row in edited.iterrows():
                 o = orig[row["id"]]
                 if row["category"] != o["category"] or row["person"] != o["person"]:
                     db.update_transaction(
                         row["id"], category=row["category"], person=row["person"]
                     )
-            st.success("Saved.")
+                    n += 1
+            st.success(f"Saved {n} change(s).")
             st.rerun()
 
 # ---------------------------------------------------------------- Dashboard
 with tab_dash:
-    st.subheader("Dashboard")
-    rows = db.fetch_transactions()
-    if not rows:
+    if df_all.empty:
         st.info("No data yet.")
+    elif fdf.empty:
+        st.warning("No transactions match the current filters.")
     else:
-        df = pd.DataFrame(rows)
-        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
-        df["month"] = df["date"].str.slice(0, 7)
+        total = fdf["amount"].sum()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total spent", f"${total:,.0f}")
+        c2.metric("Transactions", f"{len(fdf):,}")
+        c3.metric("Avg / transaction", f"${total / max(len(fdf), 1):,.0f}")
+        c4.metric("Months", fdf["month"].nunique())
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total spent", f"${df['amount'].sum():,.2f}")
-        c2.metric("Transactions", len(df))
-        c3.metric("Months", df["month"].nunique())
+        st.markdown("##### Spending over time")
+        by_mp = fdf.groupby(["month", "person"], as_index=False)["amount"].sum()
+        st.altair_chart(
+            alt.Chart(by_mp).mark_bar().encode(
+                x=alt.X("month:N", title=None),
+                y=alt.Y("amount:Q", title="Spent ($)", stack="zero"),
+                color=alt.Color("person:N", title="Person",
+                                scale=alt.Scale(scheme="tableau10")),
+                tooltip=["month", "person",
+                         alt.Tooltip("amount:Q", format="$,.2f", title="Spent")],
+            ).properties(height=300),
+            use_container_width=True,
+        )
 
-        st.markdown("**By person**")
-        st.bar_chart(df.groupby("person")["amount"].sum())
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("##### By category")
+            by_cat = fdf.groupby("category", as_index=False)["amount"].sum()
+            st.altair_chart(
+                alt.Chart(by_cat).mark_bar().encode(
+                    x=alt.X("amount:Q", title="Spent ($)"),
+                    y=alt.Y("category:N", sort="-x", title=None),
+                    color=alt.Color("category:N", legend=None,
+                                    scale=alt.Scale(scheme="tableau20")),
+                    tooltip=["category",
+                             alt.Tooltip("amount:Q", format="$,.2f", title="Spent")],
+                ).properties(height=320),
+                use_container_width=True,
+            )
+        with col_b:
+            st.markdown("##### By person")
+            by_p = fdf.groupby("person", as_index=False)["amount"].sum()
+            st.altair_chart(
+                alt.Chart(by_p).mark_arc(innerRadius=60).encode(
+                    theta=alt.Theta("amount:Q", stack=True),
+                    color=alt.Color("person:N", title="Person",
+                                    scale=alt.Scale(scheme="tableau10")),
+                    tooltip=["person",
+                             alt.Tooltip("amount:Q", format="$,.2f", title="Spent")],
+                ).properties(height=320),
+                use_container_width=True,
+            )
 
-        st.markdown("**By category**")
-        st.bar_chart(df.groupby("category")["amount"].sum())
-
-        st.markdown("**By month**")
-        st.bar_chart(df.groupby("month")["amount"].sum())
+        st.markdown("##### Top merchants")
+        by_m = (fdf.groupby("merchant", as_index=False)["amount"].sum()
+                .sort_values("amount", ascending=False).head(12))
+        st.altair_chart(
+            alt.Chart(by_m).mark_bar().encode(
+                x=alt.X("amount:Q", title="Spent ($)"),
+                y=alt.Y("merchant:N", sort="-x", title=None),
+                color=alt.Color("amount:Q", legend=None,
+                                scale=alt.Scale(scheme="blues")),
+                tooltip=["merchant",
+                         alt.Tooltip("amount:Q", format="$,.2f", title="Spent")],
+            ).properties(height=360),
+            use_container_width=True,
+        )
 
 # ---------------------------------------------------------------- People
 with tab_people:
     st.subheader("Cardholder to person mapping")
     st.caption(
-        "Map the names Claude reads off statements to a person. Useful for shared "
-        "accounts or name variations (e.g. 'JANE A DOE' -> 'Jane')."
+        "Map the names Claude reads off statements to a person. Changing a mapping "
+        "now updates existing transactions too (not just new uploads)."
     )
     mapping = db.get_name_map()
-    seen = {r["cardholder"] for r in db.fetch_transactions() if r["cardholder"]}
+    seen = {r["cardholder"] for r in all_rows if r["cardholder"]}
     for name in sorted(seen | set(mapping)):
         col1, col2 = st.columns([2, 2])
         col1.text(name or "(blank)")
@@ -205,6 +306,7 @@ with tab_people:
         if val and val != mapping.get(name, ""):
             db.set_name_map(name, val)
             st.toast(f"{name} -> {val}")
+            st.rerun()
 
     st.divider()
     with st.form("add_map"):
@@ -215,3 +317,8 @@ with tab_people:
             db.set_name_map(ch, pe)
             st.success(f"{ch} -> {pe}")
             st.rerun()
+
+    if st.button("Re-apply all mappings to existing transactions"):
+        n = db.reapply_mappings()
+        st.success(f"Re-applied mappings to {n} transaction(s).")
+        st.rerun()

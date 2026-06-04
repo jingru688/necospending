@@ -145,23 +145,42 @@ def _parse_api(pdf_bytes, client):
     if client is None:
         client = anthropic.Anthropic()
     b64 = base64.standard_b64encode(pdf_bytes).decode()
-    resp = client.messages.create(
-        model=_model() or "claude-opus-4-7",
-        max_tokens=8000,
-        system=[{"type": "text", "text": INSTRUCTIONS,
-                 "cache_control": {"type": "ephemeral"}}],
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "document", "source": {
-                    "type": "base64", "media_type": "application/pdf", "data": b64}},
-                {"type": "text",
-                 "text": "Extract all purchase transactions as the specified JSON array."},
-            ],
-        }],
+
+    last_err = None
+    for attempt in range(2):
+        resp = client.messages.create(
+            model=_model() or "claude-opus-4-7",
+            max_tokens=16000,  # long statements can produce a lot of JSON
+            system=[{"type": "text", "text": INSTRUCTIONS,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {
+                        "type": "base64", "media_type": "application/pdf", "data": b64}},
+                    {"type": "text",
+                     "text": "Extract all purchase transactions as the specified "
+                             "JSON array. Output ONLY the JSON array, nothing else."},
+                ],
+            }],
+        )
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+
+        if resp.stop_reason == "max_tokens":
+            last_err = "the statement was too long and the response got cut off"
+            print(f"[parser] attempt {attempt + 1}: stop_reason=max_tokens (truncated)")
+            continue
+        try:
+            return _extract_json(text)
+        except (json.JSONDecodeError, ValueError) as e:
+            last_err = str(e)
+            print(f"[parser] attempt {attempt + 1}: JSON parse failed: {e}; "
+                  f"response head={text[:200]!r}")
+
+    raise RuntimeError(
+        f"Couldn't read this statement reliably ({last_err}). "
+        "Please try uploading it again."
     )
-    text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    return _extract_json(text)
 
 
 # --------------------------------------------------------------------- shared
@@ -175,5 +194,5 @@ def _extract_json(text):
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1:
-        return []
+        raise ValueError("no JSON array found in the model's response")
     return json.loads(text[start : end + 1])

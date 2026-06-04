@@ -88,6 +88,30 @@ def set_name_map(cardholder, person):
             )
         else:
             conn.execute(insert(name_map).values(cardholder=cardholder, person=person))
+        # Retroactively apply to transactions already in the table so a new
+        # mapping fixes old rows instead of creating a separate "person".
+        conn.execute(
+            update(transactions)
+            .where(transactions.c.cardholder.ilike(cardholder))
+            .values(person=person)
+        )
+
+
+def reapply_mappings():
+    """Re-derive every transaction's person from the current name map."""
+    mapping = get_name_map()
+    if not mapping:
+        return 0
+    updated = 0
+    with ENGINE.begin() as conn:
+        for cardholder, person in mapping.items():
+            res = conn.execute(
+                update(transactions)
+                .where(transactions.c.cardholder.ilike(cardholder))
+                .values(person=person)
+            )
+            updated += res.rowcount or 0
+    return updated
 
 
 def get_name_map():

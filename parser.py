@@ -17,8 +17,13 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-BACKEND = os.environ.get("SPENDING_BACKEND", "cli")
-MODEL = os.environ.get("SPENDING_MODEL", "")  # "" -> backend default
+def backend():
+    """Read the backend fresh each call so config set after import is respected."""
+    return os.environ.get("SPENDING_BACKEND", "cli")
+
+
+def _model():
+    return os.environ.get("SPENDING_MODEL", "")  # "" -> backend default
 
 CATEGORIES = [
     "Groceries", "Dining", "Transport", "Travel", "Shopping",
@@ -52,7 +57,7 @@ Return [] if there are no purchase transactions."""
 
 # --------------------------------------------------------------------- dispatch
 def parse_pdf(pdf_bytes, client=None):
-    if BACKEND == "api":
+    if backend() == "api":
         return _parse_api(pdf_bytes, client)
     return _parse_cli(pdf_bytes)
 
@@ -112,8 +117,8 @@ def _parse_cli(pdf_bytes):
             "--add-dir", tmp,
             "--no-session-persistence",
         ]
-        if MODEL:
-            cmd += ["--model", MODEL]
+        if _model():
+            cmd += ["--model", _model()]
 
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if proc.returncode != 0:
@@ -141,7 +146,7 @@ def _parse_api(pdf_bytes, client):
         client = anthropic.Anthropic()
     b64 = base64.standard_b64encode(pdf_bytes).decode()
     resp = client.messages.create(
-        model=MODEL or "claude-opus-4-7",
+        model=_model() or "claude-opus-4-7",
         max_tokens=8000,
         system=[{"type": "text", "text": INSTRUCTIONS,
                  "cache_control": {"type": "ephemeral"}}],

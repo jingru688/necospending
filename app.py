@@ -24,7 +24,7 @@ import pandas as pd  # noqa: E402
 
 import db  # noqa: E402
 import parser as pdf_parser  # noqa: E402
-from parser import BACKEND, CATEGORIES, parse_pdf  # noqa: E402
+from parser import CATEGORIES, parse_pdf  # noqa: E402
 
 st.set_page_config(page_title="Household Spending", page_icon="$", layout="wide")
 db.init_db()
@@ -75,7 +75,10 @@ def _claude_bin():
         return None
 
 
-if BACKEND == "api":
+_backend = pdf_parser.backend()
+st.caption(f"Parsing mode: **{_backend}**")
+
+if _backend == "api":
     if not os.environ.get("ANTHROPIC_API_KEY"):
         st.warning(
             "API backend selected but ANTHROPIC_API_KEY is not set. Set it in your "

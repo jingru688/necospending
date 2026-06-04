@@ -107,34 +107,33 @@ if not df_all.empty:
 
 
 def _build_filters(df):
-    """Sidebar filters shared by Transactions + Dashboard. Returns the filtered df."""
+    """Top filter bar shared by Transactions + Dashboard. Returns the filtered df."""
     if df.empty:
         return df
-    st.sidebar.header("Filters")
     people = sorted(x for x in df["person"].dropna().unique() if x != "")
-    cats = sorted(x for x in df["category"].dropna().unique() if x != "")
     months = sorted(x for x in df["month"].dropna().unique() if x != "")
-    cards = sorted(x for x in df["card"].dropna().unique() if x != "")
 
-    sel_people = st.sidebar.multiselect("Person", people, default=people)
-    sel_cats = st.sidebar.multiselect("Category", cats, default=cats)
-    sel_months = st.sidebar.multiselect("Month", months, default=months)
-    sel_cards = st.sidebar.multiselect("Card", cards, default=cards)
-    search = st.sidebar.text_input("Search merchant")
-    if st.sidebar.button("Reset filters"):
-        st.rerun()
+    c1, c2, c3 = st.columns([2, 3, 2])
+    sel_people = c1.multiselect("Person", people, default=people)
+    if len(months) >= 2:
+        start, end = c2.select_slider(
+            "Timeframe", options=months, value=(months[0], months[-1])
+        )
+    else:
+        start = end = months[0] if months else None
+        if months:
+            c2.caption(f"Month: {months[0]}")
+    search = c3.text_input("Search merchant")
 
-    out = df[
-        df["person"].isin(sel_people)
-        & df["category"].isin(sel_cats)
-        & df["month"].isin(sel_months)
-        & df["card"].isin(sel_cards)
-    ]
+    out = df[df["person"].isin(sel_people)]
+    if start and end:
+        out = out[(out["month"] >= start) & (out["month"] <= end)]
     if search:
         out = out[out["merchant"].str.contains(search, case=False, na=False)]
     return out
 
 
+st.markdown("##### Filters")
 fdf = _build_filters(df_all)
 
 tab_upload, tab_txns, tab_dash, tab_people = st.tabs(
@@ -289,36 +288,39 @@ with tab_dash:
 
 # ---------------------------------------------------------------- People
 with tab_people:
-    st.subheader("Cardholder to person mapping")
+    st.subheader("Who spent it — cardholder to person")
+    rules_txt = ", ".join(f"**{last} → {person}**" for last, person in db.NAME_RULES)
     st.caption(
-        "Map the names Claude reads off statements to a person. Changing a mapping "
-        "now updates existing transactions too (not just new uploads)."
+        "Built-in rules match the **last name** shown on each charge — including "
+        "when an authorized user's name appears instead of the account owner's. "
+        f"Currently: {rules_txt}. These apply automatically to new uploads. "
+        "Use the manual override below only for names the rules don't cover."
     )
-    mapping = db.get_name_map()
-    seen = {r["cardholder"] for r in all_rows if r["cardholder"]}
-    for name in sorted(seen | set(mapping)):
-        col1, col2 = st.columns([2, 2])
-        col1.text(name or "(blank)")
-        val = col2.text_input(
-            "person", value=mapping.get(name, ""), key=f"map_{name}",
-            label_visibility="collapsed", placeholder="person name",
+
+    # Show how each cardholder seen on statements currently resolves, so you can
+    # spot any name the built-in rules miss.
+    seen = sorted({r["cardholder"] for r in all_rows if r["cardholder"]})
+    if seen:
+        st.dataframe(
+            pd.DataFrame(
+                [{"Cardholder on statement": n, "Mapped to": db.resolve_person(n)}
+                 for n in seen]
+            ),
+            hide_index=True,
+            use_container_width=True,
         )
-        if val and val != mapping.get(name, ""):
-            db.set_name_map(name, val)
-            st.toast(f"{name} -> {val}")
-            st.rerun()
+
+    if st.button("Re-apply rules to existing transactions", type="primary"):
+        n = db.reapply_mappings()
+        st.success(f"Updated {n} transaction(s).")
+        st.rerun()
 
     st.divider()
     with st.form("add_map"):
-        st.markdown("**Add a mapping manually**")
-        ch = st.text_input("Cardholder name (as on statement)")
+        st.markdown("**Manual override** (for a name the rules don't catch)")
+        ch = st.text_input("Cardholder name (exactly as on statement)")
         pe = st.text_input("Person")
         if st.form_submit_button("Add") and ch and pe:
             db.set_name_map(ch, pe)
             st.success(f"{ch} -> {pe}")
             st.rerun()
-
-    if st.button("Re-apply all mappings to existing transactions"):
-        n = db.reapply_mappings()
-        st.success(f"Re-applied mappings to {n} transaction(s).")
-        st.rerun()

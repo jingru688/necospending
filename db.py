@@ -9,6 +9,7 @@ Uses SQLAlchemy so the same code runs on:
 import datetime as _dt
 import hashlib
 import os
+import re
 
 from sqlalchemy import (
     Column, Float, MetaData, String, Table, DateTime,
@@ -63,9 +64,35 @@ def make_id(date, amount, merchant, card, occ=0):
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+# Built-in household rules: match the LAST NAME shown on the statement, in any
+# position and case-insensitively. The statement shows whoever made the charge
+# — including an authorized user whose name differs from the account owner — so
+# matching on the displayed name is correct. Add (last_name, person) pairs here.
+NAME_RULES = [
+    ("Yuan", "Neo"),
+    ("Jia", "Jessica"),
+]
+
+
+def _person_from_rules(cardholder):
+    """Return the person for a cardholder via the built-in last-name rules, or
+    None if no rule matches. Whole-token match so 'Jia' won't hit 'Jiang'."""
+    if not cardholder:
+        return None
+    tokens = set(re.split(r"[\s,]+", cardholder.lower().strip()))
+    for last, person in NAME_RULES:
+        if last.lower() in tokens:
+            return person
+    return None
+
+
 def resolve_person(cardholder):
     if not cardholder:
         return "Unknown"
+    ruled = _person_from_rules(cardholder)
+    if ruled:
+        return ruled
+    # Fall back to a manual override in name_map, then the raw name.
     with ENGINE.connect() as conn:
         row = conn.execute(
             select(name_map.c.person).where(
@@ -98,20 +125,22 @@ def set_name_map(cardholder, person):
 
 
 def reapply_mappings():
-    """Re-derive every transaction's person from the current name map."""
-    mapping = get_name_map()
-    if not mapping:
-        return 0
-    updated = 0
+    """Re-derive every transaction's person from the built-in last-name rules
+    and any manual name_map overrides. Returns the number of rows changed."""
+    rows = fetch_transactions()
+    changes = [
+        (r["id"], resolve_person(r["cardholder"]))
+        for r in rows
+        if resolve_person(r["cardholder"]) != r["person"]
+    ]
     with ENGINE.begin() as conn:
-        for cardholder, person in mapping.items():
-            res = conn.execute(
+        for tid, person in changes:
+            conn.execute(
                 update(transactions)
-                .where(transactions.c.cardholder.ilike(cardholder))
+                .where(transactions.c.id == tid)
                 .values(person=person)
             )
-            updated += res.rowcount or 0
-    return updated
+    return len(changes)
 
 
 def get_name_map():

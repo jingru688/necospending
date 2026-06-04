@@ -55,8 +55,11 @@ def init_db():
     META.create_all(ENGINE)
 
 
-def make_id(date, amount, merchant, card):
-    raw = f"{date}|{amount}|{merchant}|{card}".lower()
+def make_id(date, amount, merchant, card, occ=0):
+    # `occ` distinguishes legitimately identical charges within one statement
+    # (e.g. two $4 coffees, same day, same merchant) while keeping re-uploads of
+    # the same statement idempotent (same charges -> same occ order -> same ids).
+    raw = f"{date}|{amount}|{merchant}|{card}|{occ}".lower()
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -100,9 +103,13 @@ def get_name_map():
 def insert_transactions(txns, statement_file):
     """Insert transaction dicts. Returns (added, skipped_duplicates)."""
     added = skipped = 0
+    occ_counts = {}
     with ENGINE.begin() as conn:
         for t in txns:
-            tid = make_id(t["date"], t["amount"], t["merchant"], t.get("card", ""))
+            base = (t["date"], t["amount"], t["merchant"], t.get("card", ""))
+            occ = occ_counts.get(base, 0)
+            occ_counts[base] = occ + 1
+            tid = make_id(t["date"], t["amount"], t["merchant"], t.get("card", ""), occ)
             exists = conn.execute(
                 select(transactions.c.id).where(transactions.c.id == tid)
             ).fetchone()

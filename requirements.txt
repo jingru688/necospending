@@ -1,0 +1,5 @@
+streamlit>=1.30
+anthropic>=0.105
+pandas>=2.0
+SQLAlchemy>=1.4
+psycopg2-binary>=2.9

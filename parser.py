@@ -1,0 +1,174 @@
+"""Extract transactions from a credit-card statement PDF.
+
+Two backends:
+  - "cli"  (default): shells out to the local Claude Code binary, which uses your
+           Claude subscription (no per-token API cost). Requires a one-time
+           `claude auth login`.
+  - "api"  : uses the Anthropic API (requires ANTHROPIC_API_KEY, billed per token).
+
+Select with the SPENDING_BACKEND env var ("cli" or "api").
+"""
+
+import base64
+import glob
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+BACKEND = os.environ.get("SPENDING_BACKEND", "cli")
+MODEL = os.environ.get("SPENDING_MODEL", "")  # "" -> backend default
+
+CATEGORIES = [
+    "Groceries", "Dining", "Transport", "Travel", "Shopping",
+    "Utilities", "Entertainment", "Health", "Subscriptions",
+    "Home", "Fees", "Other",
+]
+
+INSTRUCTIONS = f"""You read a credit-card statement PDF and extract every purchase transaction.
+
+Return ONLY a JSON array (no prose, no markdown fences). Each element:
+{{
+  "date": "YYYY-MM-DD",
+  "merchant": "cleaned merchant name",
+  "amount": 12.34,
+  "cardholder": "name of the person who made the charge, if shown",
+  "card": "issuer + last 4 digits if shown, e.g. 'Chase 1234'",
+  "category": "one of {CATEGORIES}"
+}}
+
+Rules:
+- Include only purchases/charges. EXCLUDE payments, credits, refunds, interest, and account fees unless they are real spending.
+- amount is a positive number for a charge (money spent).
+- cardholder: many statements list the cardholder name next to or above each transaction
+  (shared accounts have multiple authorized users). Use the name shown for that transaction.
+  If the statement has a single cardholder, use that name for all. If no name is shown, use "".
+- card: identify the issuer (Chase, Amex, Capital One, Citi, Bank of America, etc.) and last 4 if visible.
+- category: pick the single best fit from the list. If unsure, use "Other".
+- date: convert any format to YYYY-MM-DD using the statement's year.
+Return [] if there are no purchase transactions."""
+
+
+# --------------------------------------------------------------------- dispatch
+def parse_pdf(pdf_bytes, client=None):
+    if BACKEND == "api":
+        return _parse_api(pdf_bytes, client)
+    return _parse_cli(pdf_bytes)
+
+
+# --------------------------------------------------------------------- CLI backend
+def find_claude_bin():
+    """Locate the bundled Claude Code binary (version-independent)."""
+    override = os.environ.get("CLAUDE_BIN")
+    if override and Path(override).exists():
+        return override
+    patterns = [
+        os.path.expanduser(
+            "~/Library/Application Support/Claude/claude-code/*/claude.app/Contents/MacOS/claude"
+        ),
+        os.path.expanduser("~/.claude/local/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ]
+    found = []
+    for pat in patterns:
+        found.extend(glob.glob(pat))
+    if not found:
+        raise RuntimeError(
+            "Could not find the Claude Code binary. Set CLAUDE_BIN to its full path, "
+            "or use the API backend (SPENDING_BACKEND=api)."
+        )
+    # Prefer the highest version path (lexical sort puts newer version dirs last).
+    found.sort()
+    return found[-1]
+
+
+def cli_logged_in():
+    try:
+        out = subprocess.run(
+            [find_claude_bin(), "auth", "status"],
+            capture_output=True, text=True, timeout=30,
+        )
+        return json.loads(out.stdout or "{}").get("loggedIn") is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _parse_cli(pdf_bytes):
+    claude = find_claude_bin()
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = Path(tmp) / "statement.pdf"
+        pdf_path.write_bytes(pdf_bytes)
+
+        prompt = (
+            f"Read the PDF file at {pdf_path} and extract its transactions.\n\n"
+            + INSTRUCTIONS
+        )
+        cmd = [
+            claude, "-p", prompt,
+            "--output-format", "json",
+            "--allowedTools", "Read",
+            "--add-dir", tmp,
+            "--no-session-persistence",
+        ]
+        if MODEL:
+            cmd += ["--model", MODEL]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Claude CLI failed (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout).strip()[:500]}"
+            )
+
+        # --output-format json returns an envelope; the model's text is in "result".
+        text = proc.stdout.strip()
+        try:
+            env = json.loads(text)
+            if isinstance(env, dict) and "result" in env:
+                text = env["result"]
+        except json.JSONDecodeError:
+            pass
+        return _extract_json(text)
+
+
+# --------------------------------------------------------------------- API backend
+def _parse_api(pdf_bytes, client):
+    import anthropic
+
+    if client is None:
+        client = anthropic.Anthropic()
+    b64 = base64.standard_b64encode(pdf_bytes).decode()
+    resp = client.messages.create(
+        model=MODEL or "claude-opus-4-7",
+        max_tokens=8000,
+        system=[{"type": "text", "text": INSTRUCTIONS,
+                 "cache_control": {"type": "ephemeral"}}],
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": b64}},
+                {"type": "text",
+                 "text": "Extract all purchase transactions as the specified JSON array."},
+            ],
+        }],
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    return _extract_json(text)
+
+
+# --------------------------------------------------------------------- shared
+def _extract_json(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1:
+        return []
+    return json.loads(text[start : end + 1])

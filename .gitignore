@@ -1,0 +1,6 @@
+spending.db
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.DS_Store
+*.pdf

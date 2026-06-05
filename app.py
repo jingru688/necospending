@@ -111,26 +111,45 @@ def _build_filters(df):
     if df.empty:
         return df
     people = sorted(x for x in df["person"].dropna().unique() if x != "")
-    months = sorted(x for x in df["month"].dropna().unique() if x != "")
+    dts = pd.to_datetime(df["date"], errors="coerce")
+    dmin, dmax = dts.min(), dts.max()
+    months_desc = sorted(
+        (x for x in df["month"].dropna().unique() if x != ""), reverse=True
+    )
 
     c1, c2, c3 = st.columns([2, 3, 2])
     sel_people = c1.multiselect("Person", people, default=people)
-    if len(months) >= 2:
-        start, end = c2.select_slider(
-            "Timeframe", options=months, value=(months[0], months[-1])
-        )
-    else:
-        start = end = months[0] if months else None
-        if months:
-            c2.caption(f"Month: {months[0]}")
+
+    presets = ["All time", "Latest month", "Recent 3 months",
+               "Recent 6 months", "Recent 12 months"]
+    month_opts = [f"Month: {m}" for m in months_desc]
+    choice = c2.selectbox("Period", presets + month_opts + ["Custom dates…"])
     search = c3.text_input("Search merchant")
 
-    out = df[df["person"].isin(sel_people)]
-    if start and end:
-        out = out[(out["month"] >= start) & (out["month"] <= end)]
+    # Resolve the chosen period to a [start, end] datetime window.
+    start, end = dmin, dmax
+    if choice == "Latest month" and pd.notna(dmax):
+        start = dmax.replace(day=1)
+    elif choice.startswith("Recent ") and pd.notna(dmax):
+        n = int(choice.split()[1])
+        start = dmax - pd.DateOffset(months=n)
+    elif choice.startswith("Month: "):
+        start = pd.to_datetime(choice.split("Month: ", 1)[1] + "-01")
+        end = start + pd.offsets.MonthEnd(1)
+    elif choice == "Custom dates…" and pd.notna(dmin) and pd.notna(dmax):
+        rng = c2.date_input(
+            "Date range", value=(dmin.date(), dmax.date()),
+            min_value=dmin.date(), max_value=dmax.date(),
+        )
+        if isinstance(rng, (tuple, list)) and len(rng) == 2:
+            start, end = pd.Timestamp(rng[0]), pd.Timestamp(rng[1])
+
+    mask = df["person"].isin(sel_people)
+    if pd.notna(start) and pd.notna(end):
+        mask = mask & (dts >= start) & (dts <= end)
     if search:
-        out = out[out["merchant"].str.contains(search, case=False, na=False)]
-    return out
+        mask = mask & df["merchant"].str.contains(search, case=False, na=False)
+    return df[mask]
 
 
 st.markdown("##### Filters")

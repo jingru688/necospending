@@ -28,31 +28,42 @@ def _model():
 CATEGORIES = [
     "Groceries", "Dining", "Transport", "Travel", "Shopping",
     "Utilities", "Entertainment", "Health", "Subscriptions",
-    "Home", "Fees", "Other",
+    "Home", "Rent", "Fees", "Other",
 ]
 
-INSTRUCTIONS = f"""You read a credit-card statement PDF and extract every purchase transaction.
+INSTRUCTIONS = f"""You read a bank statement PDF and extract every transaction that is money the household actually SPENT.
+
+The PDF may be a CREDIT CARD statement or a DEBIT / CHECKING account statement. Handle both.
 
 Return ONLY a JSON array (no prose, no markdown fences). Each element:
 {{
   "date": "YYYY-MM-DD",
-  "merchant": "cleaned merchant name",
+  "merchant": "cleaned merchant or payee name",
   "amount": 12.34,
-  "cardholder": "name of the person who made the charge, if shown",
-  "card": "issuer + last 4 digits if shown, e.g. 'Chase 1234'",
+  "cardholder": "name of the person who made the charge / the account holder, if shown",
+  "card": "issuer or bank + last 4 if shown, e.g. 'Chase 1234' or 'BofA Checking 5678'",
   "category": "one of {CATEGORIES}"
 }}
 
+INCLUDE (real spending — money leaving the household for an expense):
+- Purchases and charges on a credit or debit card.
+- Rent payments.
+- Money SENT to another person (Venmo / Zelle / Cash App / PayPal / wire going OUT).
+
+EXCLUDE (do NOT output these at all):
+- Any INCOMING money: salary / payroll / direct deposit, interest earned, cashback or rewards, refunds, and money RECEIVED from other people.
+- Credit-card payments made from a checking account (e.g. "Payment to Chase card", "AUTOPAY", "BILL PAY VISA", "ONLINE PAYMENT - AMEX"). These just pay off a card whose purchases are already recorded elsewhere; including them double-counts.
+- Transfers between the household's own accounts.
+- Account fees and interest charged, unless they are a real cost you want tracked.
+
 Rules:
-- Include only purchases/charges. EXCLUDE payments, credits, refunds, interest, and account fees unless they are real spending.
-- amount is a positive number for a charge (money spent).
-- cardholder: many statements list the cardholder name next to or above each transaction
-  (shared accounts have multiple authorized users). Use the name shown for that transaction.
-  If the statement has a single cardholder, use that name for all. If no name is shown, use "".
-- card: identify the issuer (Chase, Amex, Capital One, Citi, Bank of America, etc.) and last 4 if visible.
-- category: pick the single best fit from the list. If unsure, use "Other".
+- amount is a POSITIVE number for money spent.
+- Use the description and whether the line is a debit/withdrawal vs a credit/deposit to decide direction. Only outflows that are genuine expenses count.
+- cardholder: many statements list a name next to or above each transaction (shared accounts have multiple authorized users). Use the name shown for that transaction. If there is a single account holder, use that name for all. If no name is shown, use "".
+- card: identify the issuer/bank (Chase, Amex, Capital One, Citi, Bank of America, etc.) and last 4 if visible.
+- category: pick the single best fit. Rent -> "Rent". Money sent to a person with no clearer purpose -> "Other". If unsure, "Other".
 - date: convert any format to YYYY-MM-DD using the statement's year.
-Return [] if there are no purchase transactions."""
+Return [] if there are no qualifying spending transactions."""
 
 
 # --------------------------------------------------------------------- dispatch

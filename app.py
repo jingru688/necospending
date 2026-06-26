@@ -166,22 +166,32 @@ with tab_upload:
         for msg in st.session_state.pop("upload_msgs", []):
             st.success(msg)
     files = st.file_uploader(
-        "Drop one or more credit-card statement PDFs",
+        "Drop one or more credit-card or debit/checking statement PDFs",
         type="pdf",
         accept_multiple_files=True,
     )
+    force = st.checkbox("Re-import even if a statement was already uploaded")
     if files and st.button("Parse & record", type="primary"):
         msgs = []
         for f in files:
+            data = f.getvalue()
+            fhash = db.statement_hash(data)
+            if db.statement_seen(fhash) and not force:
+                msgs.append(
+                    f"{f.name}: this exact statement was already uploaded — skipped. "
+                    "(Tick 'Re-import' above to force it.)"
+                )
+                continue
             with st.spinner(f"Reading {f.name} with Claude..."):
                 try:
-                    txns = parse_pdf(f.getvalue())
+                    txns = parse_pdf(data)
                 except Exception as e:  # noqa: BLE001
                     st.error(f"{f.name}: {e}")
                     continue
                 for t in txns:
                     t["person"] = db.resolve_person(t.get("cardholder", ""))
                 added, skipped = db.insert_transactions(txns, f.name)
+                db.record_statement(fhash, f.name, added)
             msgs.append(
                 f"{f.name}: {added} added, {skipped} duplicates skipped "
                 f"({len(txns)} found)."
@@ -232,6 +242,44 @@ with tab_txns:
                     n += 1
             st.success(f"Saved {n} change(s).")
             st.rerun()
+
+    if not df_all.empty:
+        with st.expander("Clean up duplicate transactions"):
+            st.caption(
+                "Finds charges with the same date, amount, merchant and card — "
+                "usually from uploading a statement twice — keeping the oldest copy. "
+                "New uploads of the same file are now blocked automatically; use this "
+                "to clean up ones saved before. A genuinely repeated same-day charge "
+                "could also show up here, so untick anything you want to keep."
+            )
+            dup_ids = db.find_duplicate_ids()
+            if not dup_ids:
+                st.success("No duplicates found.")
+            else:
+                dups = df_all[df_all["id"].isin(dup_ids)][
+                    ["id", "date", "merchant", "amount", "card", "person"]
+                ].copy()
+                dups.insert(0, "remove", True)
+                st.write(f"Found **{len(dup_ids)}** likely duplicate(s). "
+                         "Ticked rows will be deleted:")
+                picked = st.data_editor(
+                    dups,
+                    column_config={
+                        "id": None,
+                        "remove": st.column_config.CheckboxColumn("Remove"),
+                        "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+                    },
+                    disabled=["date", "merchant", "amount", "card", "person"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="dup_editor",
+                )
+                to_delete = [r["id"] for _, r in picked.iterrows() if r["remove"]]
+                if st.button(f"Delete {len(to_delete)} selected", type="primary",
+                             disabled=not to_delete):
+                    n = db.delete_transactions(to_delete)
+                    st.success(f"Deleted {n} duplicate(s).")
+                    st.rerun()
 
 # ---------------------------------------------------------------- Dashboard
 with tab_dash:

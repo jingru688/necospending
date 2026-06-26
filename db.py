@@ -12,7 +12,7 @@ import os
 import re
 
 from sqlalchemy import (
-    Column, Float, MetaData, String, Table, DateTime,
+    Column, Float, Integer, MetaData, String, Table, DateTime,
     create_engine, delete, insert, select, update,
 )
 
@@ -49,6 +49,17 @@ name_map = Table(
     "name_map", META,
     Column("cardholder", String, primary_key=True),
     Column("person", String),
+)
+
+# Records which statement PDFs have been imported, keyed by a hash of the file's
+# bytes. Lets us reject re-uploading the same file even when parsing is not
+# byte-for-byte reproducible.
+statements = Table(
+    "statements", META,
+    Column("file_hash", String, primary_key=True),
+    Column("filename", String),
+    Column("txn_count", Integer),
+    Column("imported_at", DateTime, default=_dt.datetime.utcnow),
 )
 
 
@@ -204,6 +215,16 @@ def delete_transaction(tid):
         conn.execute(delete(transactions).where(transactions.c.id == tid))
 
 
+def delete_transactions(ids):
+    """Delete many transactions by id. Returns the number removed."""
+    ids = list(ids)
+    if not ids:
+        return 0
+    with ENGINE.begin() as conn:
+        res = conn.execute(delete(transactions).where(transactions.c.id.in_(ids)))
+    return res.rowcount or 0
+
+
 def fetch_transactions():
     with ENGINE.connect() as conn:
         rows = conn.execute(
@@ -212,3 +233,62 @@ def fetch_transactions():
             )
         ).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+# ----------------------------------------------------------------- statements
+def statement_hash(pdf_bytes):
+    """Stable fingerprint of a statement file's contents."""
+    return hashlib.sha256(pdf_bytes).hexdigest()
+
+
+def statement_seen(file_hash):
+    with ENGINE.connect() as conn:
+        return conn.execute(
+            select(statements.c.file_hash).where(
+                statements.c.file_hash == file_hash
+            )
+        ).fetchone() is not None
+
+
+def record_statement(file_hash, filename, count):
+    with ENGINE.begin() as conn:
+        exists = conn.execute(
+            select(statements.c.file_hash).where(
+                statements.c.file_hash == file_hash
+            )
+        ).fetchone()
+        vals = dict(filename=filename, txn_count=count,
+                    imported_at=_dt.datetime.utcnow())
+        if exists:
+            conn.execute(
+                update(statements)
+                .where(statements.c.file_hash == file_hash)
+                .values(**vals)
+            )
+        else:
+            conn.execute(insert(statements).values(file_hash=file_hash, **vals))
+
+
+# ----------------------------------------------------------------- de-duplication
+def _dup_sig(r):
+    """Signature for spotting duplicate charges across re-uploads of one
+    statement. Date, amount and card come verbatim from the statement, so they
+    match exactly; merchant is reduced to letters only so parse wording
+    differences ('STARBUCKS #123' vs 'Starbucks') still collapse together."""
+    merchant = re.sub(r"[^a-z]", "", (r.get("merchant") or "").lower())
+    amount = round(float(r.get("amount") or 0), 2)
+    return (str(r.get("date")), amount, merchant, (r.get("card") or "").lower())
+
+
+def find_duplicate_ids():
+    """Ids of duplicate transactions, keeping the earliest of each matching set."""
+    rows = fetch_transactions()
+    groups = {}
+    for r in rows:
+        groups.setdefault(_dup_sig(r), []).append(r)
+    dup_ids = []
+    for rs in groups.values():
+        if len(rs) > 1:
+            rs.sort(key=lambda x: str(x.get("created_at") or ""))
+            dup_ids.extend(r["id"] for r in rs[1:])
+    return dup_ids

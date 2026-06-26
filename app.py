@@ -155,8 +155,8 @@ def _build_filters(df):
 st.markdown("##### Filters")
 fdf = _build_filters(df_all)
 
-tab_upload, tab_txns, tab_dash, tab_people = st.tabs(
-    ["Upload", "Transactions", "Dashboard", "People"]
+tab_upload, tab_txns, tab_dash, tab_people, tab_history = st.tabs(
+    ["Upload", "Transactions", "Dashboard", "People", "History"]
 )
 
 # ---------------------------------------------------------------- Upload
@@ -232,12 +232,14 @@ with tab_txns:
         )
         if st.button("Save edits", type="primary"):
             orig = {r["id"]: r for r in all_rows}
+            batch = db.new_batch()
             n = 0
             for _, row in edited.iterrows():
                 o = orig[row["id"]]
                 if row["category"] != o["category"] or row["person"] != o["person"]:
                     db.update_transaction(
-                        row["id"], category=row["category"], person=row["person"]
+                        row["id"], category=row["category"], person=row["person"],
+                        batch=batch, label="Edit transactions",
                     )
                     n += 1
             st.success(f"Saved {n} change(s).")
@@ -391,3 +393,28 @@ with tab_people:
             db.set_name_map(ch, pe)
             st.success(f"{ch} -> {pe}")
             st.rerun()
+
+# ---------------------------------------------------------------- History
+with tab_history:
+    st.subheader("History — undo a mistake")
+    st.caption(
+        "Every upload, edit, and delete is recorded here. Click **Undo** to reverse "
+        "one — deleted transactions come back, edits roll back, and an upload's rows "
+        "are removed. (Only actions taken from now on are tracked.)"
+    )
+    actions = db.fetch_history()
+    if not actions:
+        st.info("No actions recorded yet.")
+    else:
+        for a in actions:
+            ts = a["ts"]
+            when = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts)
+            c1, c2 = st.columns([5, 1])
+            status = " · _already undone_" if a["undone"] else ""
+            c1.markdown(
+                f"**{a['label']}** — {a['count']} row(s) · {when}{status}"
+            )
+            if c2.button("Undo", key=f"undo_{a['batch']}", disabled=a["undone"]):
+                n = db.undo_batch(a["batch"])
+                st.success(f"Reversed {n} change(s).")
+                st.rerun()

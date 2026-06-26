@@ -9,8 +9,10 @@ Uses SQLAlchemy so the same code runs on:
 import datetime as _dt
 import difflib
 import hashlib
+import json
 import os
 import re
+import uuid
 
 from sqlalchemy import (
     Column, Float, Integer, MetaData, String, Table, DateTime,
@@ -63,9 +65,59 @@ statements = Table(
     Column("imported_at", DateTime, default=_dt.datetime.utcnow),
 )
 
+# Audit log of every change to transactions so any action (upload, edit, delete)
+# can be undone. One user action shares a `batch` id; `before`/`after` hold the
+# row as JSON so a delete can be re-inserted and an edit rolled back.
+history = Table(
+    "history", META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("ts", DateTime, default=_dt.datetime.utcnow),
+    Column("action", String),   # insert | update | delete
+    Column("batch", String),    # groups the rows touched by one user action
+    Column("label", String),    # human-readable description
+    Column("txn_id", String),
+    Column("before", String),   # JSON of the row before (None for insert)
+    Column("after", String),    # JSON of the row after (None for delete)
+    Column("undone", Integer, default=0),
+)
+
 
 def init_db():
     META.create_all(ENGINE)
+
+
+def new_batch():
+    return uuid.uuid4().hex
+
+
+def _row_json(row):
+    """Serialize a transaction row dict to JSON (datetimes -> ISO strings)."""
+    if row is None:
+        return None
+    d = dict(row)
+    if isinstance(d.get("created_at"), _dt.datetime):
+        d["created_at"] = d["created_at"].isoformat()
+    return json.dumps(d)
+
+
+def _json_row(s):
+    if not s:
+        return None
+    d = json.loads(s)
+    ca = d.get("created_at")
+    if isinstance(ca, str):
+        try:
+            d["created_at"] = _dt.datetime.fromisoformat(ca)
+        except ValueError:
+            d["created_at"] = _dt.datetime.utcnow()
+    return d
+
+
+def _log(conn, action, batch, label, txn_id, before=None, after=None):
+    conn.execute(insert(history).values(
+        ts=_dt.datetime.utcnow(), action=action, batch=batch, label=label,
+        txn_id=txn_id, before=_row_json(before), after=_row_json(after), undone=0,
+    ))
 
 
 def make_id(date, amount, merchant, card, occ=0):
@@ -169,6 +221,8 @@ def insert_transactions(txns, statement_file):
     """Insert transaction dicts. Returns (added, skipped_duplicates)."""
     added = skipped = 0
     occ_counts = {}
+    batch = new_batch()
+    label = f"Upload {statement_file}"
     with ENGINE.begin() as conn:
         for t in txns:
             base = (t["date"], t["amount"], t["merchant"], t.get("card", ""))
@@ -181,25 +235,25 @@ def insert_transactions(txns, statement_file):
             if exists:
                 skipped += 1
                 continue
-            conn.execute(
-                insert(transactions).values(
-                    id=tid,
-                    date=t["date"],
-                    merchant=t["merchant"],
-                    amount=t["amount"],
-                    category=t.get("category", "Uncategorized"),
-                    cardholder=t.get("cardholder", ""),
-                    person=t.get("person", resolve_person(t.get("cardholder", ""))),
-                    card=t.get("card", ""),
-                    statement_file=statement_file,
-                    created_at=_dt.datetime.utcnow(),
-                )
+            vals = dict(
+                id=tid,
+                date=t["date"],
+                merchant=t["merchant"],
+                amount=t["amount"],
+                category=t.get("category", "Uncategorized"),
+                cardholder=t.get("cardholder", ""),
+                person=t.get("person", resolve_person(t.get("cardholder", ""))),
+                card=t.get("card", ""),
+                statement_file=statement_file,
+                created_at=_dt.datetime.utcnow(),
             )
+            conn.execute(insert(transactions).values(**vals))
+            _log(conn, "insert", batch, label, tid, before=None, after=vals)
             added += 1
     return added, skipped
 
 
-def update_transaction(tid, category=None, person=None):
+def update_transaction(tid, category=None, person=None, batch=None, label="Edit"):
     vals = {}
     if category is not None:
         vals["category"] = category
@@ -208,20 +262,35 @@ def update_transaction(tid, category=None, person=None):
     if not vals:
         return
     with ENGINE.begin() as conn:
+        before = conn.execute(
+            select(transactions).where(transactions.c.id == tid)
+        ).fetchone()
+        before = dict(before._mapping) if before else None
         conn.execute(update(transactions).where(transactions.c.id == tid).values(**vals))
+        after = conn.execute(
+            select(transactions).where(transactions.c.id == tid)
+        ).fetchone()
+        after = dict(after._mapping) if after else None
+        _log(conn, "update", batch or new_batch(), label, tid, before, after)
 
 
-def delete_transaction(tid):
-    with ENGINE.begin() as conn:
-        conn.execute(delete(transactions).where(transactions.c.id == tid))
+def delete_transaction(tid, batch=None, label="Delete transaction"):
+    delete_transactions([tid], batch=batch, label=label)
 
 
-def delete_transactions(ids):
+def delete_transactions(ids, batch=None, label="Delete duplicates"):
     """Delete many transactions by id. Returns the number removed."""
     ids = list(ids)
     if not ids:
         return 0
+    batch = batch or new_batch()
     with ENGINE.begin() as conn:
+        rows = conn.execute(
+            select(transactions).where(transactions.c.id.in_(ids))
+        ).fetchall()
+        for r in rows:
+            m = dict(r._mapping)
+            _log(conn, "delete", batch, label, m["id"], before=m, after=None)
         res = conn.execute(delete(transactions).where(transactions.c.id.in_(ids)))
     return res.rowcount or 0
 
@@ -234,6 +303,67 @@ def fetch_transactions():
             )
         ).fetchall()
     return [dict(r._mapping) for r in rows]
+
+
+# ----------------------------------------------------------------- history / undo
+def fetch_history(limit=50):
+    """Recent actions, newest first, grouped into one row per user action."""
+    with ENGINE.connect() as conn:
+        rows = conn.execute(select(history).order_by(history.c.id.desc())).fetchall()
+    batches, order = {}, []
+    for r in rows:
+        m = r._mapping
+        b = m["batch"]
+        if b not in batches:
+            batches[b] = {"batch": b, "ts": m["ts"], "action": m["action"],
+                          "label": m["label"], "count": 0, "undone": True}
+            order.append(b)
+        batches[b]["count"] += 1
+        if not m["undone"]:
+            batches[b]["undone"] = False  # batch is still active if any row stands
+    return [batches[b] for b in order][:limit]
+
+
+def undo_batch(batch):
+    """Reverse every not-yet-undone change in a batch. Returns rows affected."""
+    with ENGINE.begin() as conn:
+        entries = conn.execute(
+            select(history)
+            .where(history.c.batch == batch, history.c.undone == 0)
+            .order_by(history.c.id.desc())
+        ).fetchall()
+        n = 0
+        for e in entries:
+            m = e._mapping
+            action = m["action"]
+            if action == "insert":
+                conn.execute(
+                    delete(transactions).where(transactions.c.id == m["txn_id"])
+                )
+            elif action == "delete":
+                row = _json_row(m["before"])
+                if row:
+                    already = conn.execute(
+                        select(transactions.c.id).where(
+                            transactions.c.id == row["id"]
+                        )
+                    ).fetchone()
+                    if not already:
+                        conn.execute(insert(transactions).values(**row))
+            elif action == "update":
+                row = _json_row(m["before"])
+                if row:
+                    conn.execute(
+                        update(transactions)
+                        .where(transactions.c.id == m["txn_id"])
+                        .values(category=row.get("category"),
+                                person=row.get("person"))
+                    )
+            conn.execute(
+                update(history).where(history.c.id == m["id"]).values(undone=1)
+            )
+            n += 1
+    return n
 
 
 # ----------------------------------------------------------------- statements

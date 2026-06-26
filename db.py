@@ -7,6 +7,7 @@ Uses SQLAlchemy so the same code runs on:
 """
 
 import datetime as _dt
+import difflib
 import hashlib
 import os
 import re
@@ -270,25 +271,46 @@ def record_statement(file_hash, filename, count):
 
 
 # ----------------------------------------------------------------- de-duplication
-def _dup_sig(r):
-    """Signature for spotting duplicate charges across re-uploads of one
-    statement. Date, amount and card come verbatim from the statement, so they
-    match exactly; merchant is reduced to letters only so parse wording
-    differences ('STARBUCKS #123' vs 'Starbucks') still collapse together."""
-    merchant = re.sub(r"[^a-z]", "", (r.get("merchant") or "").lower())
+def _dup_key(r):
+    """Hard key for a charge: date, amount and card all come verbatim from the
+    statement, so they must match exactly for two rows to be the same charge."""
     amount = round(float(r.get("amount") or 0), 2)
-    return (str(r.get("date")), amount, merchant, (r.get("card") or "").lower())
+    return (str(r.get("date")), amount, (r.get("card") or "").lower())
+
+
+def _norm_merchant(m):
+    return re.sub(r"[^a-z0-9]+", " ", (m or "").lower()).strip()
+
+
+def _similar_merchant(a, b, threshold=0.6):
+    """Whether two merchant names refer to the same payee, allowing for parse
+    wording differences ('carle consolidated pmt' vs 'carle consolidated
+    payment'). Same first word, or a high overall similarity, counts as a match."""
+    a, b = _norm_merchant(a), _norm_merchant(b)
+    if not a or not b or a == b:
+        return True
+    if a.split(" ", 1)[0] == b.split(" ", 1)[0]:  # same leading word, e.g. 'carle'
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= threshold
 
 
 def find_duplicate_ids():
-    """Ids of duplicate transactions, keeping the earliest of each matching set."""
+    """Ids of duplicate transactions. Rows are duplicates when date, amount and
+    card match exactly AND the merchant names are similar (need not be identical).
+    The earliest of each cluster is kept; the rest are returned as duplicates."""
     rows = fetch_transactions()
     groups = {}
     for r in rows:
-        groups.setdefault(_dup_sig(r), []).append(r)
+        groups.setdefault(_dup_key(r), []).append(r)
     dup_ids = []
-    for rs in groups.values():
-        if len(rs) > 1:
-            rs.sort(key=lambda x: str(x.get("created_at") or ""))
-            dup_ids.extend(r["id"] for r in rs[1:])
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda x: str(x.get("created_at") or ""))
+        kept = []  # representative rows we keep
+        for r in group:
+            if any(_similar_merchant(r["merchant"], k["merchant"]) for k in kept):
+                dup_ids.append(r["id"])
+            else:
+                kept.append(r)
     return dup_ids

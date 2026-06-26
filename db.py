@@ -54,6 +54,24 @@ name_map = Table(
     Column("person", String),
 )
 
+# Maps a whole account (by the card/account string on the statement) to a person
+# or to "Shared". Used for joint accounts where the statement shows one name but
+# the spending belongs to both — e.g. a checking account that pays rent/utilities.
+card_map = Table(
+    "card_map", META,
+    Column("card", String, primary_key=True),
+    Column("person", String),
+)
+
+# Maps a specific payee/merchant to a person. The key case: a joint account that
+# pays each partner's OWN rent/utilities (long-distance, separate bills) — the
+# statement can't say whose, but the landlord/provider name can. Most specific.
+merchant_map = Table(
+    "merchant_map", META,
+    Column("merchant", String, primary_key=True),
+    Column("person", String),
+)
+
 # Records which statement PDFs have been imported, keyed by a hash of the file's
 # bytes. Lets us reject re-uploading the same file even when parsing is not
 # byte-for-byte reproducible.
@@ -150,7 +168,25 @@ def _person_from_rules(cardholder):
     return None
 
 
-def resolve_person(cardholder):
+def resolve_person(cardholder, card="", merchant=""):
+    # Most specific wins: a payee rule (each partner's own landlord/utility on a
+    # joint account) > a whole-account rule > the name on the statement.
+    if merchant:
+        with ENGINE.connect() as conn:
+            mrow = conn.execute(
+                select(merchant_map.c.person).where(
+                    merchant_map.c.merchant.ilike(merchant)
+                )
+            ).fetchone()
+        if mrow:
+            return mrow[0]
+    if card:
+        with ENGINE.connect() as conn:
+            crow = conn.execute(
+                select(card_map.c.person).where(card_map.c.card.ilike(card))
+            ).fetchone()
+        if crow:
+            return crow[0]
     if not cardholder:
         return "Unknown"
     ruled = _person_from_rules(cardholder)
@@ -179,24 +215,22 @@ def set_name_map(cardholder, person):
             )
         else:
             conn.execute(insert(name_map).values(cardholder=cardholder, person=person))
-        # Retroactively apply to transactions already in the table so a new
-        # mapping fixes old rows instead of creating a separate "person".
-        conn.execute(
-            update(transactions)
-            .where(transactions.c.cardholder.ilike(cardholder))
-            .values(person=person)
-        )
+    # Recompute all rows so the right precedence (merchant > card > name) holds,
+    # instead of blindly overwriting rows that have a more specific rule.
+    reapply_mappings()
 
 
 def reapply_mappings():
-    """Re-derive every transaction's person from the built-in last-name rules
-    and any manual name_map overrides. Returns the number of rows changed."""
+    """Re-derive every transaction's person from the card mapping, built-in
+    last-name rules, and manual name overrides. Returns the number changed."""
     rows = fetch_transactions()
-    changes = [
-        (r["id"], resolve_person(r["cardholder"]))
-        for r in rows
-        if resolve_person(r["cardholder"]) != r["person"]
-    ]
+    changes = []
+    for r in rows:
+        np = resolve_person(
+            r.get("cardholder", ""), r.get("card", ""), r.get("merchant", "")
+        )
+        if np != r["person"]:
+            changes.append((r["id"], np))
     with ENGINE.begin() as conn:
         for tid, person in changes:
             conn.execute(
@@ -215,6 +249,65 @@ def get_name_map():
             )
         ).fetchall()
     return {r[0]: r[1] for r in rows}
+
+
+def get_card_map():
+    with ENGINE.connect() as conn:
+        rows = conn.execute(
+            select(card_map.c.card, card_map.c.person).order_by(card_map.c.card)
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def set_card_map(card, person):
+    with ENGINE.begin() as conn:
+        exists = conn.execute(
+            select(card_map.c.card).where(card_map.c.card == card)
+        ).fetchone()
+        if exists:
+            conn.execute(
+                update(card_map).where(card_map.c.card == card).values(person=person)
+            )
+        else:
+            conn.execute(insert(card_map).values(card=card, person=person))
+    reapply_mappings()  # respects merchant > card > name precedence
+
+
+def clear_card_map(card):
+    """Remove a card override; existing rows keep their value until re-applied."""
+    with ENGINE.begin() as conn:
+        conn.execute(delete(card_map).where(card_map.c.card == card))
+
+
+def get_merchant_map():
+    with ENGINE.connect() as conn:
+        rows = conn.execute(
+            select(merchant_map.c.merchant, merchant_map.c.person).order_by(
+                merchant_map.c.merchant
+            )
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def set_merchant_map(merchant, person):
+    with ENGINE.begin() as conn:
+        exists = conn.execute(
+            select(merchant_map.c.merchant).where(merchant_map.c.merchant == merchant)
+        ).fetchone()
+        if exists:
+            conn.execute(
+                update(merchant_map)
+                .where(merchant_map.c.merchant == merchant)
+                .values(person=person)
+            )
+        else:
+            conn.execute(insert(merchant_map).values(merchant=merchant, person=person))
+    reapply_mappings()  # respects merchant > card > name precedence
+
+
+def clear_merchant_map(merchant):
+    with ENGINE.begin() as conn:
+        conn.execute(delete(merchant_map).where(merchant_map.c.merchant == merchant))
 
 
 def insert_transactions(txns, statement_file):
@@ -242,7 +335,8 @@ def insert_transactions(txns, statement_file):
                 amount=t["amount"],
                 category=t.get("category", "Uncategorized"),
                 cardholder=t.get("cardholder", ""),
-                person=t.get("person", resolve_person(t.get("cardholder", ""))),
+                person=t.get("person", resolve_person(
+                    t.get("cardholder", ""), t.get("card", ""), t.get("merchant", ""))),
                 card=t.get("card", ""),
                 statement_file=statement_file,
                 created_at=_dt.datetime.utcnow(),

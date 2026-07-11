@@ -152,24 +152,6 @@ def _build_filters(df):
     return df[mask]
 
 
-def _split_shared(df, real_people):
-    """Reallocate 'Shared' rows equally across the real people, for per-person
-    views. Leaves non-shared rows untouched."""
-    if df.empty or not real_people:
-        return df
-    shared = df[df["person"] == "Shared"]
-    if shared.empty:
-        return df
-    rest = df[df["person"] != "Shared"]
-    parts = [rest]
-    for p in real_people:
-        s = shared.copy()
-        s["person"] = p
-        s["amount"] = s["amount"] / len(real_people)
-        parts.append(s)
-    return pd.concat(parts, ignore_index=True)
-
-
 st.markdown("##### Filters")
 fdf = _build_filters(df_all)
 
@@ -232,7 +214,7 @@ with tab_txns:
             f"Showing {len(fdf)} of {len(df_all)} transactions · "
             f"filtered total ${fdf['amount'].sum():,.2f}"
         )
-        people = sorted(set(df_all["person"].dropna()) | {"Unknown", "Shared"})
+        people = sorted(set(df_all["person"].dropna()) | {"Unknown"})
         edited = st.data_editor(
             fdf[["id", "date", "merchant", "amount", "category", "person",
                  "cardholder", "card"]],
@@ -317,22 +299,8 @@ with tab_dash:
         c3.metric("Avg / transaction", f"${total / max(len(fdf), 1):,.0f}")
         c4.metric("Months", fdf["month"].nunique())
 
-        real_people = sorted(
-            p for p in fdf["person"].dropna().unique()
-            if p not in ("Shared", "Unknown", "")
-        )
-        has_shared = (fdf["person"] == "Shared").any()
-        split = False
-        if has_shared and real_people:
-            split = st.checkbox(
-                "Split shared expenses equally between people",
-                help="Allocates each 'Shared' charge (rent, utilities, etc.) "
-                     "evenly across people for the per-person views below.",
-            )
-        pdf = _split_shared(fdf, real_people) if split else fdf
-
         st.markdown("##### Spending over time")
-        by_mp = pdf.groupby(["month", "person"], as_index=False)["amount"].sum()
+        by_mp = fdf.groupby(["month", "person"], as_index=False)["amount"].sum()
         st.altair_chart(
             alt.Chart(by_mp).mark_bar().encode(
                 x=alt.X("month:N", title=None),
@@ -362,7 +330,7 @@ with tab_dash:
             )
         with col_b:
             st.markdown("##### By person")
-            by_p = pdf.groupby("person", as_index=False)["amount"].sum()
+            by_p = fdf.groupby("person", as_index=False)["amount"].sum()
             st.altair_chart(
                 alt.Chart(by_p).mark_arc(innerRadius=60).encode(
                     theta=alt.Theta("amount:Q", stack=True),
@@ -414,28 +382,29 @@ with tab_people:
         )
 
     st.divider()
-    st.markdown("##### Accounts (assign a whole card/account to a person)")
+    st.markdown("##### Cards — assign each card to its owner")
     st.caption(
-        "For a **joint account** — e.g. a checking account that pays rent, "
-        "utilities, internet — set it to **Shared** so every charge on it is "
-        "marked shared instead of guessed from the name on the statement. This "
-        "overrides the name rules above for that account."
+        "Credit-card statements label each charge with the **authorized user** who "
+        "made it, so a card you share (e.g. you buying on your partner's card) gets "
+        "split by name. Assign a card to its **owner** here and every charge on it "
+        "goes to that person — ignoring the name on individual transactions. This "
+        "overrides the name rules above."
     )
     card_map = db.get_card_map()
     cards = sorted({r["card"] for r in all_rows if r["card"]} | set(card_map))
-    person_opts = ["(auto — use name)", "Shared"] + sorted(
-        {db.resolve_person(c) for c in seen} | {"Neo", "Jessica"}
-    )
-    person_opts = list(dict.fromkeys(person_opts))  # de-dup, keep order
+    person_opts = list(dict.fromkeys(
+        ["(auto — use name)"]
+        + sorted({db.resolve_person(c) for c in seen} | {"Neo", "Jessica"})
+    ))
     if not cards:
-        st.caption("No accounts seen yet. Upload a statement first.")
+        st.caption("No cards seen yet. Upload a statement first.")
     for card in cards:
         col1, col2 = st.columns([2, 2])
         col1.text(card)
         current = card_map.get(card, "(auto — use name)")
         idx = person_opts.index(current) if current in person_opts else 0
         choice = col2.selectbox(
-            "account person", person_opts, index=idx,
+            "card owner", person_opts, index=idx,
             key=f"card_{card}", label_visibility="collapsed",
         )
         if choice != current:
@@ -445,46 +414,6 @@ with tab_people:
             else:
                 db.set_card_map(card, choice)
             st.toast(f"{card} -> {choice}")
-            st.rerun()
-
-    st.divider()
-    st.markdown("##### Payees (assign a specific charge to a person)")
-    st.caption(
-        "For a joint account that pays each of you **separately** — your own rent "
-        "and your partner's rent, your internet and theirs — map each payee to the "
-        "right person. The statement can't say whose charge it is, but the "
-        "landlord/provider name can. Applies to all past and future charges from "
-        "that payee."
-    )
-    ppl_opts = list(dict.fromkeys(
-        ["Neo", "Jessica", "Shared"] + sorted({db.resolve_person(c) for c in seen})
-    ))
-    merch_map = db.get_merchant_map()
-    for m in sorted(merch_map):
-        c1, c2, c3 = st.columns([3, 2, 1])
-        c1.text(m)
-        cur = merch_map[m]
-        idx = ppl_opts.index(cur) if cur in ppl_opts else 0
-        ch = c2.selectbox("payee person", ppl_opts, index=idx,
-                          key=f"merch_{m}", label_visibility="collapsed")
-        if ch != cur:
-            db.set_merchant_map(m, ch)
-            st.toast(f"{m} -> {ch}")
-            st.rerun()
-        if c3.button("Remove", key=f"delm_{m}"):
-            db.clear_merchant_map(m)
-            db.reapply_mappings()
-            st.rerun()
-
-    all_merchants = sorted({r["merchant"] for r in all_rows if r["merchant"]})
-    with st.form("add_merch"):
-        st.markdown("**Add a payee rule**")
-        cols = st.columns([3, 2, 1])
-        new_m = cols[0].selectbox("Payee / merchant", [""] + all_merchants)
-        new_p = cols[1].selectbox("Person", ppl_opts, key="new_merch_person")
-        if cols[2].form_submit_button("Add") and new_m:
-            db.set_merchant_map(new_m, new_p)
-            st.toast(f"{new_m} -> {new_p}")
             st.rerun()
 
     st.divider()
